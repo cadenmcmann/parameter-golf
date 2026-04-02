@@ -1186,12 +1186,15 @@ def eval_val_sliding_cache(
     compiled_ok = False
     if device.type == "cuda":
         try:
-            # Tuple returns compile fine on Hopper, but keep an eager fallback if this regresses.
             compiled_fwd = torch.compile(base_model.forward_logits_and_hidden, dynamic=False, fullgraph=True)
             compiled_ok = True
         except Exception:
             compiled_fwd = base_model.forward_logits_and_hidden
 
+    _log0 = print if rank == 0 else lambda *a, **k: None
+    _t_cache_start = time.perf_counter()
+    _total_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs
+    _batches_done = 0
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1265,6 +1268,11 @@ def eval_val_sliding_cache(
 
                 cache.add(scored_hidden, scored_targets)
                 ngram.update(scored_inputs, scored_targets, prev_prev)
+            _batches_done += 1
+            if _batches_done % 50 == 0 or _batches_done == _total_batches:
+                _elapsed = time.perf_counter() - _t_cache_start
+                _running_bpb = (loss_sum / max(token_count, 1)).item() / math.log(2.0) * (max(token_count, 1) / max(byte_count, 1)).item() if token_count > 0 else 0.0
+                _log0(f"  cache_progress [{_batches_done}/{_total_batches}] bpb={_running_bpb:.6f} time={_elapsed:.1f}s")
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)

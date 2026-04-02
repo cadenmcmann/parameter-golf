@@ -1054,67 +1054,78 @@ class GPT(nn.Module):
         return logits, x
 
 
-class HiddenStateCache:
-    """Ring-buffer cache mapping hidden states to next-token distributions via similarity."""
+class ExactSequenceCache:
+    """Hash-table cache for exact token N-gram matching.
 
-    def __init__(self, max_size: int, hidden_dim: int, vocab_size: int, device: torch.device):
-        self.keys = torch.zeros(max_size, hidden_dim, dtype=torch.float32, device=device)
-        self.values = torch.zeros(max_size, dtype=torch.long, device=device)
-        self.max_size = max_size
+    Stores token sequences of lengths min_order..max_order seen in scored text.
+    At query time, checks for the longest matching prefix and returns a distribution
+    concentrated on the token(s) that followed that exact sequence.
+    When no match is found, returns None (stays completely silent).
+    """
+
+    def __init__(self, vocab_size: int, min_order: int = 3, max_order: int = 8):
         self.vocab_size = vocab_size
-        self.count = 0
-        self.write_idx = 0
+        self.min_order = min_order
+        self.max_order = max_order
+        # dict mapping tuple(token_ids) -> dict{next_token: count}
+        self.table: dict[tuple[int, ...], dict[int, int]] = {}
+        self.total_entries = 0
 
-    def add(self, hidden_states: Tensor, next_tokens: Tensor) -> None:
-        if hidden_states.numel() == 0:
-            return
-        normed = F.normalize(hidden_states, dim=-1)
-        values = next_tokens.long()
-        n = normed.shape[0]
-        if n >= self.max_size:
-            normed = normed[-self.max_size :]
-            values = values[-self.max_size :]
-            n = self.max_size
-        end = self.write_idx + n
-        if end <= self.max_size:
-            self.keys[self.write_idx:end] = normed
-            self.values[self.write_idx:end] = values
-        else:
-            first = self.max_size - self.write_idx
-            second = n - first
-            self.keys[self.write_idx:] = normed[:first]
-            self.values[self.write_idx:] = values[:first]
-            self.keys[:second] = normed[first:]
-            self.values[:second] = values[first:]
-        self.write_idx = (self.write_idx + n) % self.max_size
-        self.count = min(self.count + n, self.max_size)
+    def update(self, tokens: list[int]) -> None:
+        """Add all N-grams from a token sequence. tokens is a flat list of token IDs."""
+        n = len(tokens)
+        for order in range(self.min_order, self.max_order + 1):
+            for i in range(n - order):
+                key = tuple(tokens[i:i + order])
+                next_tok = tokens[i + order]
+                if key not in self.table:
+                    self.table[key] = {}
+                    self.total_entries += 1
+                counts = self.table[key]
+                counts[next_tok] = counts.get(next_tok, 0) + 1
 
-    def query(self, hidden_states: Tensor, temperature: float = 0.1, return_diagnostics: bool = False) -> Tensor | tuple[Tensor, dict]:
-        n = hidden_states.shape[0]
-        if self.count == 0:
-            dist = torch.full(
-                (n, self.vocab_size),
-                1.0 / self.vocab_size,
-                device=self.keys.device,
-                dtype=torch.float32,
-            )
-            if return_diagnostics:
-                return dist, {"top_sim": torch.zeros(n, device=self.keys.device), "top_token": torch.zeros(n, dtype=torch.long, device=self.keys.device), "empty": True}
-            return dist
-        q = F.normalize(hidden_states, dim=-1)
-        active_keys = self.keys[:self.count]
-        raw_sim = q @ active_keys.T  # (n, count) — cosine similarities before temperature
-        sim = raw_sim / temperature
-        weights = F.softmax(sim, dim=-1)
-        result = torch.zeros(n, self.vocab_size, device=hidden_states.device, dtype=torch.float32)
-        active_values = self.values[:self.count]
-        expanded_values = active_values.unsqueeze(0).expand(n, -1)
-        result.scatter_add_(1, expanded_values, weights)
-        if return_diagnostics:
-            top_sim, top_idx = raw_sim.max(dim=-1)  # best cosine sim per query
-            top_token = active_values[top_idx]  # what token the best match stored
-            return result, {"top_sim": top_sim, "top_token": top_token, "empty": False}
-        return result
+    def query_single(self, context: list[int]) -> tuple[int | None, float] | None:
+        """Given a context (recent tokens), find the longest exact match.
+        Returns (predicted_token, confidence) or None if no match."""
+        for order in range(self.max_order, self.min_order - 1, -1):
+            if len(context) < order:
+                continue
+            key = tuple(context[-order:])
+            if key in self.table:
+                counts = self.table[key]
+                total = sum(counts.values())
+                best_tok = max(counts, key=counts.get)
+                confidence = counts[best_tok] / total
+                return best_tok, confidence
+        return None
+
+    def query_batch(self, val_tokens: Tensor, positions: Tensor, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
+        """Query for a batch of positions.
+        Args:
+            val_tokens: full validation token tensor (on CPU is fine)
+            positions: (N,) global token positions to query
+            device: device for output tensors
+        Returns:
+            matched: (N,) bool — whether an exact match was found
+            predictions: (N,) long — predicted next token (only valid where matched=True)
+            confidences: (N,) float — confidence of prediction (only valid where matched=True)
+        """
+        n = positions.shape[0]
+        matched = torch.zeros(n, dtype=torch.bool, device=device)
+        predictions = torch.zeros(n, dtype=torch.long, device=device)
+        confidences = torch.zeros(n, dtype=torch.float32, device=device)
+        val_tok_list = val_tokens.tolist() if not isinstance(val_tokens, list) else val_tokens
+        for i in range(n):
+            pos = positions[i].item()
+            # Get context: up to max_order tokens before this position
+            ctx_start = max(0, pos - self.max_order)
+            context = val_tok_list[ctx_start:pos]
+            result = self.query_single(context)
+            if result is not None:
+                matched[i] = True
+                predictions[i] = result[0]
+                confidences[i] = result[1]
+        return matched, predictions, confidences
 
 
 class NGramModel:
@@ -1170,7 +1181,7 @@ def eval_val_sliding_cache(
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
 ) -> tuple[float, float]:
-    """Sliding-window evaluation with a hidden-state cache and count-based sidecar."""
+    """Sliding-window evaluation with exact-sequence matching sidecar."""
     seq_len = eval_seq_len or args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     window_starts = [ws for ws in range(0, total_tokens, stride)
@@ -1184,31 +1195,23 @@ def eval_val_sliding_cache(
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
 
-    cache = HiddenStateCache(args.cache_size, args.model_dim, args.vocab_size, device)
-    ngram = NGramModel(args.vocab_size, device, hash_size=args.ngram_hash_size)
-    lm = args.cache_lambda_model
-    lc = args.cache_lambda_cache
-    ln = args.cache_lambda_ngram
+    # Exact sequence cache — no hidden states needed
+    seq_cache = ExactSequenceCache(args.vocab_size, min_order=3, max_order=8)
+    lc = args.cache_lambda_cache  # weight for exact-match predictions
+    # Keep val_tokens as a CPU list for fast Python-level lookups
+    val_tok_list = val_tokens.tolist()
 
-    compiled_fwd = base_model.forward_logits_and_hidden
-    compiled_ok = False
-    if device.type == "cuda":
-        try:
-            compiled_fwd = torch.compile(base_model.forward_logits_and_hidden, dynamic=False, fullgraph=True)
-            compiled_ok = True
-        except Exception:
-            compiled_fwd = base_model.forward_logits_and_hidden
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
 
     _log0 = print if rank == 0 else lambda *a, **k: None
     _t_cache_start = time.perf_counter()
     _total_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs
     _batches_done = 0
-    # Diagnostics accumulators
+    # Diagnostics
     _diag_total_positions = 0
-    _diag_sim_sum = 0.0
-    _diag_cache_correct = 0
-    _diag_cache_correct_hi_entropy = 0
-    _diag_hi_entropy_positions = 0
+    _diag_matched_positions = 0
+    _diag_match_correct = 0
+    _diag_match_confidence_sum = 0.0
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1223,16 +1226,8 @@ def eval_val_sliding_cache(
                 chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
                 x_batch[i, :wlen] = chunk[:-1]
                 y_batch[i, :wlen] = chunk[1:]
-            try:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits, hidden = compiled_fwd(x_batch)
-            except Exception:
-                if not compiled_ok:
-                    raise
-                compiled_fwd = base_model.forward_logits_and_hidden
-                compiled_ok = False
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits, hidden = compiled_fwd(x_batch)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = compiled_logits(x_batch)
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
@@ -1241,43 +1236,37 @@ def eval_val_sliding_cache(
                     continue
 
                 scored_logits = logits[i, s:wlen].float()
-                scored_hidden = hidden[i, s:wlen].float()
                 scored_targets = y_batch[i, s:wlen]
-                scored_inputs = x_batch[i, s:wlen]
 
-                p_model = F.softmax(scored_logits, dim=-1)
-                p_cache, _cache_diag = cache.query(scored_hidden, temperature=args.cache_temperature, return_diagnostics=True)
+                p_model = F.softmax(scored_logits, dim=-1)  # (num_scored, vocab)
 
-                # Collect diagnostics
-                if not _cache_diag["empty"]:
-                    _diag_total_positions += num_scored
-                    _diag_sim_sum += _cache_diag["top_sim"].sum().item()
-                    _cache_top_correct = (_cache_diag["top_token"] == scored_targets).sum().item()
-                    _diag_cache_correct += _cache_top_correct
+                # Query exact sequence cache for each scored position
+                global_positions = torch.arange(ws + s + 1, ws + wlen + 1, device=device)
+                matched, predictions, confidences = seq_cache.query_batch(
+                    val_tok_list, global_positions, device
+                )
 
-                if s > 0:
-                    prev_prev = x_batch[i, s - 1:wlen - 1]
+                _diag_total_positions += num_scored
+                n_matched = matched.sum().item()
+                _diag_matched_positions += n_matched
+                if n_matched > 0:
+                    _diag_match_correct += (predictions[matched] == scored_targets[matched]).sum().item()
+                    _diag_match_confidence_sum += confidences[matched].sum().item()
+
+                # Blend: where matched, mix model with exact-match prediction;
+                # where not matched, use model unchanged (no dilution!)
+                if n_matched > 0:
+                    p_final = p_model.clone()
+                    # For matched positions, create a one-hot distribution for the predicted token
+                    match_dist = torch.zeros(n_matched, args.vocab_size, device=device, dtype=torch.float32)
+                    match_dist.scatter_(1, predictions[matched].unsqueeze(1), 1.0)
+                    # Blend: scale by confidence — high confidence = trust the match more
+                    match_conf = (confidences[matched] * lc).unsqueeze(1)  # (n_matched, 1)
+                    match_conf = match_conf.clamp(max=0.5)  # cap at 50% influence
+                    p_final[matched] = (1.0 - match_conf) * p_model[matched] + match_conf * match_dist
                 else:
-                    prev_prev = None
-                p_ngram = ngram.query(scored_inputs, prev_prev)
+                    p_final = p_model
 
-                if cache.count > 0 and args.cache_adaptive:
-                    entropy = -(p_model * torch.log(p_model + 1e-10)).sum(dim=-1)
-                    max_entropy = math.log(args.vocab_size)
-                    # Diagnostics: track cache accuracy on high-entropy positions
-                    if not _cache_diag["empty"]:
-                        hi_mask = entropy > (0.5 * max_entropy)
-                        _diag_hi_entropy_positions += hi_mask.sum().item()
-                        _diag_cache_correct_hi_entropy += ((_cache_diag["top_token"] == scored_targets) & hi_mask).sum().item()
-                    h = (entropy / max_entropy).unsqueeze(-1)
-                    lc_h = lc * h
-                    ln_h = ln * h
-                    lm_h = 1.0 - lc_h - ln_h
-                    p_final = lm_h * p_model + lc_h * p_cache + ln_h * p_ngram
-                elif cache.count > 0:
-                    p_final = lm * p_model + lc * p_cache + ln * p_ngram
-                else:
-                    p_final = (lm + lc) * p_model + ln * p_ngram
                 p_final = p_final.clamp(min=1e-10)
 
                 target_probs = p_final.gather(1, scored_targets.unsqueeze(1)).squeeze(1)
@@ -1292,13 +1281,17 @@ def eval_val_sliding_cache(
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                 byte_count += tb.sum()
 
-                cache.add(scored_hidden, scored_targets)
-                ngram.update(scored_inputs, scored_targets, prev_prev)
+                # Update cache with scored tokens (score-first!)
+                scored_start = ws + s
+                scored_end = ws + wlen
+                seq_cache.update(val_tok_list[max(0, scored_start - seq_cache.max_order):scored_end + 1])
+
             _batches_done += 1
             if _batches_done % 50 == 0 or _batches_done == _total_batches:
                 _elapsed = time.perf_counter() - _t_cache_start
                 _running_bpb = (loss_sum / max(token_count, 1)).item() / math.log(2.0) * (max(token_count, 1) / max(byte_count, 1)).item() if token_count > 0 else 0.0
-                _log0(f"  cache_progress [{_batches_done}/{_total_batches}] bpb={_running_bpb:.6f} time={_elapsed:.1f}s")
+                _match_rate = _diag_matched_positions / max(_diag_total_positions, 1)
+                _log0(f"  cache_progress [{_batches_done}/{_total_batches}] bpb={_running_bpb:.6f} match_rate={_match_rate:.4f} time={_elapsed:.1f}s")
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -1306,15 +1299,13 @@ def eval_val_sliding_cache(
     val_loss = (loss_sum / token_count).item()
     bits_per_token = val_loss / math.log(2.0)
     tokens_per_byte = token_count.item() / byte_count.item()
-    # Print diagnostics summary
+    # Print diagnostics
     if _diag_total_positions > 0:
-        _avg_sim = _diag_sim_sum / _diag_total_positions
-        _cache_acc = _diag_cache_correct / _diag_total_positions
-        _hi_ent_acc = _diag_cache_correct_hi_entropy / max(_diag_hi_entropy_positions, 1)
-        _hi_ent_frac = _diag_hi_entropy_positions / _diag_total_positions
-        _log0(f"  cache_diag: avg_top_sim={_avg_sim:.4f} cache_top1_acc={_cache_acc:.4f} "
-              f"hi_entropy_frac={_hi_ent_frac:.4f} hi_entropy_cache_acc={_hi_ent_acc:.4f} "
-              f"total_positions={_diag_total_positions}")
+        _match_rate = _diag_matched_positions / _diag_total_positions
+        _match_acc = _diag_match_correct / max(_diag_matched_positions, 1)
+        _avg_conf = _diag_match_confidence_sum / max(_diag_matched_positions, 1)
+        _log0(f"  exact_match_diag: match_rate={_match_rate:.4f} match_accuracy={_match_acc:.4f} "
+              f"avg_confidence={_avg_conf:.4f} matched={_diag_matched_positions} total={_diag_total_positions}")
     base_model.train()
     return val_loss, bits_per_token * tokens_per_byte
 

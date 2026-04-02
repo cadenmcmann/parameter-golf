@@ -106,6 +106,12 @@ class Hyperparameters:
     cache_lambda_cache = float(os.environ.get("CACHE_LAMBDA_CACHE", "0.10"))
     cache_lambda_ngram = float(os.environ.get("CACHE_LAMBDA_NGRAM", "0.05"))
     ngram_hash_size = int(os.environ.get("NGRAM_HASH_SIZE", "16384"))
+    # Eval-only mode (skip training, load checkpoint)
+    eval_only_checkpoint = os.environ.get("EVAL_ONLY_CHECKPOINT", "")
+    # Checkpoint saving
+    checkpoint_save_path = os.environ.get("CHECKPOINT_SAVE_PATH", "")
+    # Token subset for fast eval iteration
+    eval_token_limit = int(os.environ.get("EVAL_TOKEN_LIMIT", "0"))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1710,6 +1716,90 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if args.eval_token_limit > 0 and args.eval_token_limit < val_tokens.numel():
+        original_len = val_tokens.numel()
+        val_tokens = val_tokens[:args.eval_token_limit]
+        log0(f"eval_token_limit: using first {val_tokens.numel()} of {original_len} tokens")
+    # --- Eval-only mode: skip training, load checkpoint, run eval ---
+    if args.eval_only_checkpoint:
+        log0(f"eval_only_mode: loading {args.eval_only_checkpoint}")
+        with open(args.eval_only_checkpoint, "rb") as f:
+            quant_blob_disk = f.read()
+        log0(f"checkpoint_bytes: {len(quant_blob_disk)}")
+        quant_state = torch.load(
+            io.BytesIO(lzma.decompress(quant_blob_disk)),
+            map_location="cpu",
+        )
+        # Create throwaway model on CPU to get state dict structure for unbanking
+        _tmp_model = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            mtp_num_heads=0, mtp_loss_weight=0.0,
+            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n,
+            rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
+            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+            gated_attention=args.gated_attention, value_residual=args.value_residual,
+        ).to("cpu")
+        sd_cpu = {k: v.detach().cpu() for k, v in _tmp_model.state_dict().items()}
+        del _tmp_model
+        unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+        deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
+        deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
+        eval_model = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            mtp_num_heads=0, mtp_loss_weight=0.0,
+            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n,
+            rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
+            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+            gated_attention=args.gated_attention, value_residual=args.value_residual,
+        ).to(device).bfloat16()
+        eval_model.qo_bank.data = eval_model.qo_bank.data.float()
+        eval_model.kv_bank.data = eval_model.kv_bank.data.float()
+        eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
+        eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+        for m in eval_model.modules():
+            if isinstance(m, CastedLinear):
+                m.float()
+        restore_low_dim_params_to_fp32(eval_model)
+        eval_model.load_state_dict(deq_state, strict=True)
+        log0("eval_only_mode: model loaded, starting eval")
+        sw_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+        if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+            torch.cuda.synchronize()
+            t_slide = time.perf_counter()
+            sw_val_loss, sw_val_bpb = eval_val_sliding(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride,
+                eval_seq_len=sw_seq_len,
+            )
+            torch.cuda.synchronize()
+            log0(f"sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+                 f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
+            log0(f"sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        if args.cache_enabled and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+            torch.cuda.synchronize()
+            t_cache = time.perf_counter()
+            cache_loss, cache_bpb = eval_val_sliding_cache(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride,
+                eval_seq_len=sw_seq_len,
+            )
+            torch.cuda.synchronize()
+            log0(f"cache_sidecar val_loss:{cache_loss:.4f} val_bpb:{cache_bpb:.4f} "
+                 f"eval_time:{1000.0 * (time.perf_counter() - t_cache):.0f}ms")
+            log0(f"cache_sidecar_exact val_loss:{cache_loss:.8f} val_bpb:{cache_bpb:.8f}")
+        if distributed:
+            dist.destroy_process_group()
+        return
     CastedLinear._qat_enabled = args.qat_enabled
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -2057,6 +2147,10 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model int6+lzma: {quant_file_bytes} bytes")
         log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
+        if args.checkpoint_save_path:
+            import shutil
+            shutil.copy2("final_model.int6.ptz", args.checkpoint_save_path)
+            log0(f"checkpoint_saved: {args.checkpoint_save_path}")
     if distributed:
         dist.barrier()
     with open("final_model.int6.ptz", "rb") as f:

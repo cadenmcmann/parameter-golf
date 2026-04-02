@@ -1089,23 +1089,31 @@ class HiddenStateCache:
         self.write_idx = (self.write_idx + n) % self.max_size
         self.count = min(self.count + n, self.max_size)
 
-    def query(self, hidden_states: Tensor, temperature: float = 0.1) -> Tensor:
+    def query(self, hidden_states: Tensor, temperature: float = 0.1, return_diagnostics: bool = False) -> Tensor | tuple[Tensor, dict]:
         n = hidden_states.shape[0]
         if self.count == 0:
-            return torch.full(
+            dist = torch.full(
                 (n, self.vocab_size),
                 1.0 / self.vocab_size,
                 device=self.keys.device,
                 dtype=torch.float32,
             )
+            if return_diagnostics:
+                return dist, {"top_sim": torch.zeros(n, device=self.keys.device), "top_token": torch.zeros(n, dtype=torch.long, device=self.keys.device), "empty": True}
+            return dist
         q = F.normalize(hidden_states, dim=-1)
         active_keys = self.keys[:self.count]
-        sim = (q @ active_keys.T) / temperature
+        raw_sim = q @ active_keys.T  # (n, count) — cosine similarities before temperature
+        sim = raw_sim / temperature
         weights = F.softmax(sim, dim=-1)
         result = torch.zeros(n, self.vocab_size, device=hidden_states.device, dtype=torch.float32)
         active_values = self.values[:self.count]
         expanded_values = active_values.unsqueeze(0).expand(n, -1)
         result.scatter_add_(1, expanded_values, weights)
+        if return_diagnostics:
+            top_sim, top_idx = raw_sim.max(dim=-1)  # best cosine sim per query
+            top_token = active_values[top_idx]  # what token the best match stored
+            return result, {"top_sim": top_sim, "top_token": top_token, "empty": False}
         return result
 
 
@@ -1195,6 +1203,12 @@ def eval_val_sliding_cache(
     _t_cache_start = time.perf_counter()
     _total_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs
     _batches_done = 0
+    # Diagnostics accumulators
+    _diag_total_positions = 0
+    _diag_sim_sum = 0.0
+    _diag_cache_correct = 0
+    _diag_cache_correct_hi_entropy = 0
+    _diag_hi_entropy_positions = 0
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1232,7 +1246,14 @@ def eval_val_sliding_cache(
                 scored_inputs = x_batch[i, s:wlen]
 
                 p_model = F.softmax(scored_logits, dim=-1)
-                p_cache = cache.query(scored_hidden, temperature=args.cache_temperature)
+                p_cache, _cache_diag = cache.query(scored_hidden, temperature=args.cache_temperature, return_diagnostics=True)
+
+                # Collect diagnostics
+                if not _cache_diag["empty"]:
+                    _diag_total_positions += num_scored
+                    _diag_sim_sum += _cache_diag["top_sim"].sum().item()
+                    _cache_top_correct = (_cache_diag["top_token"] == scored_targets).sum().item()
+                    _diag_cache_correct += _cache_top_correct
 
                 if s > 0:
                     prev_prev = x_batch[i, s - 1:wlen - 1]
@@ -1243,6 +1264,11 @@ def eval_val_sliding_cache(
                 if cache.count > 0 and args.cache_adaptive:
                     entropy = -(p_model * torch.log(p_model + 1e-10)).sum(dim=-1)
                     max_entropy = math.log(args.vocab_size)
+                    # Diagnostics: track cache accuracy on high-entropy positions
+                    if not _cache_diag["empty"]:
+                        hi_mask = entropy > (0.5 * max_entropy)
+                        _diag_hi_entropy_positions += hi_mask.sum().item()
+                        _diag_cache_correct_hi_entropy += ((_cache_diag["top_token"] == scored_targets) & hi_mask).sum().item()
                     h = (entropy / max_entropy).unsqueeze(-1)
                     lc_h = lc * h
                     ln_h = ln * h
@@ -1280,6 +1306,15 @@ def eval_val_sliding_cache(
     val_loss = (loss_sum / token_count).item()
     bits_per_token = val_loss / math.log(2.0)
     tokens_per_byte = token_count.item() / byte_count.item()
+    # Print diagnostics summary
+    if _diag_total_positions > 0:
+        _avg_sim = _diag_sim_sum / _diag_total_positions
+        _cache_acc = _diag_cache_correct / _diag_total_positions
+        _hi_ent_acc = _diag_cache_correct_hi_entropy / max(_diag_hi_entropy_positions, 1)
+        _hi_ent_frac = _diag_hi_entropy_positions / _diag_total_positions
+        _log0(f"  cache_diag: avg_top_sim={_avg_sim:.4f} cache_top1_acc={_cache_acc:.4f} "
+              f"hi_entropy_frac={_hi_ent_frac:.4f} hi_entropy_cache_acc={_hi_ent_acc:.4f} "
+              f"total_positions={_diag_total_positions}")
     base_model.train()
     return val_loss, bits_per_token * tokens_per_byte
 

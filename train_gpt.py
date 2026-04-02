@@ -1311,6 +1311,10 @@ def eval_val_sliding(
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    _sw_log0 = print if rank == 0 else lambda *a, **k: None
+    _sw_t0 = time.perf_counter()
+    _sw_total_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs
+    _sw_batches_done = 0
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1343,6 +1347,11 @@ def eval_val_sliding(
                 tb = base_bytes_lut[tgt].to(torch.float64)
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                 byte_count += tb.sum()
+            _sw_batches_done += 1
+            if _sw_batches_done % 50 == 0 or _sw_batches_done == _sw_total_batches:
+                _sw_elapsed = time.perf_counter() - _sw_t0
+                _sw_running_bpb = (loss_sum / max(token_count, 1)).item() / math.log(2.0) * (max(token_count, 1) / max(byte_count, 1)).item() if token_count > 0 else 0.0
+                _sw_log0(f"  sw_progress [{_sw_batches_done}/{_sw_total_batches}] bpb={_sw_running_bpb:.6f} time={_sw_elapsed:.1f}s")
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)

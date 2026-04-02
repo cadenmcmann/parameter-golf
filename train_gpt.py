@@ -112,6 +112,8 @@ class Hyperparameters:
     checkpoint_save_path = os.environ.get("CHECKPOINT_SAVE_PATH", "")
     # Token subset for fast eval iteration
     eval_token_limit = int(os.environ.get("EVAL_TOKEN_LIMIT", "0"))
+    # Skip eval (train + save checkpoint only)
+    skip_eval = bool(int(os.environ.get("SKIP_EVAL", "0")))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -2151,6 +2153,11 @@ def main() -> None:
             import shutil
             shutil.copy2("final_model.int6.ptz", args.checkpoint_save_path)
             log0(f"checkpoint_saved: {args.checkpoint_save_path}")
+    if args.skip_eval:
+        log0("skip_eval: skipping all evaluation, exiting after checkpoint save")
+        if distributed:
+            dist.destroy_process_group()
+        return
     if distributed:
         dist.barrier()
     with open("final_model.int6.ptz", "rb") as f:

@@ -1196,7 +1196,7 @@ def eval_val_sliding_cache(
     base_model.eval()
 
     # Exact sequence cache — no hidden states needed
-    seq_cache = ExactSequenceCache(args.vocab_size, min_order=3, max_order=8)
+    seq_cache = ExactSequenceCache(args.vocab_size, min_order=6, max_order=12)
     lc = args.cache_lambda_cache  # weight for exact-match predictions
     # Keep val_tokens as a CPU list for fast Python-level lookups
     val_tok_list = val_tokens.tolist()

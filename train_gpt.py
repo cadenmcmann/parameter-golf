@@ -114,6 +114,8 @@ class Hyperparameters:
     eval_token_limit = int(os.environ.get("EVAL_TOKEN_LIMIT", "0"))
     # Skip eval (train + save checkpoint only)
     skip_eval = bool(int(os.environ.get("SKIP_EVAL", "0")))
+    # Adaptive entropy-based cache gating
+    cache_adaptive = bool(int(os.environ.get("CACHE_ADAPTIVE", "1")))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1235,7 +1237,15 @@ def eval_val_sliding_cache(
                     prev_prev = None
                 p_ngram = ngram.query(scored_inputs, prev_prev)
 
-                if cache.count > 0:
+                if cache.count > 0 and args.cache_adaptive:
+                    entropy = -(p_model * torch.log(p_model + 1e-10)).sum(dim=-1)
+                    max_entropy = math.log(args.vocab_size)
+                    h = (entropy / max_entropy).unsqueeze(-1)
+                    lc_h = lc * h
+                    ln_h = ln * h
+                    lm_h = 1.0 - lc_h - ln_h
+                    p_final = lm_h * p_model + lc_h * p_cache + ln_h * p_ngram
+                elif cache.count > 0:
                     p_final = lm * p_model + lc * p_cache + ln * p_ngram
                 else:
                     p_final = (lm + lc) * p_model + ln * p_ngram

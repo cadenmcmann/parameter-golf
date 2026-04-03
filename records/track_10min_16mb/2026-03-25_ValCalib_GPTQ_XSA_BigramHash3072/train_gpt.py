@@ -94,16 +94,6 @@ class Hyperparameters:
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
-    # Sequence matching (evaluation-time exact N-gram matching)
-    seq_match_enabled = bool(int(os.environ.get("SEQ_MATCH_ENABLED", "0")))
-    seq_match_lambda = float(os.environ.get("SEQ_MATCH_LAMBDA", "0.15"))
-    seq_match_min_order = int(os.environ.get("SEQ_MATCH_MIN_ORDER", "8"))
-    seq_match_max_order = int(os.environ.get("SEQ_MATCH_MAX_ORDER", "12"))
-    # Eval-only mode
-    eval_only_checkpoint = os.environ.get("EVAL_ONLY_CHECKPOINT", "")
-    checkpoint_save_path = os.environ.get("CHECKPOINT_SAVE_PATH", "")
-    eval_token_limit = int(os.environ.get("EVAL_TOKEN_LIMIT", "0"))
-    skip_eval = bool(int(os.environ.get("SKIP_EVAL", "0")))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1015,192 +1005,6 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-class ExactSequenceCache:
-    """Hash-table cache for exact token N-gram matching."""
-
-    def __init__(self, vocab_size: int, min_order: int = 3, max_order: int = 8):
-        self.vocab_size = vocab_size
-        self.min_order = min_order
-        self.max_order = max_order
-        self.table: dict[tuple[int, ...], dict[int, int]] = {}
-        self.total_entries = 0
-
-    def update(self, tokens: list[int]) -> None:
-        n = len(tokens)
-        for order in range(self.min_order, self.max_order + 1):
-            for i in range(n - order):
-                key = tuple(tokens[i:i + order])
-                next_tok = tokens[i + order]
-                if key not in self.table:
-                    self.table[key] = {}
-                    self.total_entries += 1
-                counts = self.table[key]
-                counts[next_tok] = counts.get(next_tok, 0) + 1
-
-    def query_single(self, context: list[int]) -> tuple[int | None, float] | None:
-        for order in range(self.max_order, self.min_order - 1, -1):
-            if len(context) < order:
-                continue
-            key = tuple(context[-order:])
-            if key in self.table:
-                counts = self.table[key]
-                total = sum(counts.values())
-                best_tok = max(counts, key=counts.get)
-                confidence = counts[best_tok] / total
-                return best_tok, confidence
-        return None
-
-    def query_batch(self, val_tokens, positions: Tensor, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
-        n = positions.shape[0]
-        matched = torch.zeros(n, dtype=torch.bool, device=device)
-        predictions = torch.zeros(n, dtype=torch.long, device=device)
-        confidences = torch.zeros(n, dtype=torch.float32, device=device)
-        val_tok_list = val_tokens if isinstance(val_tokens, list) else val_tokens.tolist()
-        for i in range(n):
-            pos = positions[i].item()
-            ctx_start = max(0, pos - self.max_order)
-            context = val_tok_list[ctx_start:pos]
-            result = self.query_single(context)
-            if result is not None:
-                matched[i] = True
-                predictions[i] = result[0]
-                confidences[i] = result[1]
-        return matched, predictions, confidences
-
-
-def eval_val_sliding_seq_match(
-    args: Hyperparameters,
-    base_model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    stride: int,
-    batch_seqs: int = 32,
-    eval_seq_len: int | None = None,
-) -> tuple[float, float]:
-    """Sliding-window evaluation with exact-sequence matching."""
-    seq_len = eval_seq_len or args.train_seq_len
-    total_tokens = val_tokens.numel() - 1
-    window_starts = [ws for ws in range(0, total_tokens, stride)
-                     if min(ws + seq_len, total_tokens) - ws >= 1]
-    total_windows = len(window_starts)
-    my_s = (total_windows * rank) // world_size
-    my_e = (total_windows * (rank + 1)) // world_size
-    my_windows = window_starts[my_s:my_e]
-    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    token_count = torch.zeros((), device=device, dtype=torch.float64)
-    byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    base_model.eval()
-
-    seq_cache = ExactSequenceCache(args.vocab_size, min_order=args.seq_match_min_order, max_order=args.seq_match_max_order)
-    lc = args.seq_match_lambda
-    val_tok_list = val_tokens.tolist()
-
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
-
-    _log0 = print if rank == 0 else lambda *a, **k: None
-    _t_start = time.perf_counter()
-    _total_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs
-    _batches_done = 0
-    _diag_total = 0
-    _diag_matched = 0
-    _diag_correct = 0
-    _diag_conf_sum = 0.0
-    with torch.inference_mode():
-        for bi in range(0, len(my_windows), batch_seqs):
-            batch_ws = my_windows[bi:bi + batch_seqs]
-            bsz = len(batch_ws)
-            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-            wlens: list[int] = []
-            for i, ws in enumerate(batch_ws):
-                end = min(ws + seq_len, total_tokens)
-                wlen = end - ws
-                wlens.append(wlen)
-                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
-                x_batch[i, :wlen] = chunk[:-1]
-                y_batch[i, :wlen] = chunk[1:]
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = compiled_logits(x_batch)
-            for i, ws in enumerate(batch_ws):
-                wlen = wlens[i]
-                s = 0 if ws == 0 else max(wlen - stride, 0)
-                num_scored = wlen - s
-                if num_scored <= 0:
-                    continue
-
-                scored_logits = logits[i, s:wlen].float()
-                scored_targets = y_batch[i, s:wlen]
-
-                p_model = F.softmax(scored_logits, dim=-1)
-
-                global_positions = torch.arange(ws + s + 1, ws + wlen + 1, device=device)
-                matched, predictions, confidences = seq_cache.query_batch(
-                    val_tok_list, global_positions, device
-                )
-
-                _diag_total += num_scored
-                n_matched = matched.sum().item()
-                _diag_matched += n_matched
-                if n_matched > 0:
-                    _diag_correct += (predictions[matched] == scored_targets[matched]).sum().item()
-                    _diag_conf_sum += confidences[matched].sum().item()
-
-                if n_matched > 0:
-                    p_final = p_model.clone()
-                    match_dist = torch.zeros(n_matched, args.vocab_size, device=device, dtype=torch.float32)
-                    match_dist.scatter_(1, predictions[matched].unsqueeze(1), 1.0)
-                    match_conf = (confidences[matched] * lc).unsqueeze(1)
-                    match_conf = match_conf.clamp(max=0.5)
-                    p_final[matched] = (1.0 - match_conf) * p_model[matched] + match_conf * match_dist
-                else:
-                    p_final = p_model
-
-                p_final = p_final.clamp(min=1e-10)
-
-                target_probs = p_final.gather(1, scored_targets.unsqueeze(1)).squeeze(1)
-                scored_nll = -torch.log(target_probs).to(torch.float64)
-
-                loss_sum += scored_nll.sum()
-                token_count += float(num_scored)
-
-                tgt = y_batch[i, s:wlen]
-                prev = x_batch[i, s:wlen]
-                tb = base_bytes_lut[tgt].to(torch.float64)
-                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                byte_count += tb.sum()
-
-                scored_start = ws + s
-                scored_end = ws + wlen
-                seq_cache.update(val_tok_list[max(0, scored_start - seq_cache.max_order):scored_end + 1])
-
-            _batches_done += 1
-            if _batches_done % 50 == 0 or _batches_done == _total_batches:
-                _elapsed = time.perf_counter() - _t_start
-                _running_bpb = (loss_sum / max(token_count, 1)).item() / math.log(2.0) * (max(token_count, 1) / max(byte_count, 1)).item() if token_count > 0 else 0.0
-                _match_rate = _diag_matched / max(_diag_total, 1)
-                _log0(f"  seq_match_progress [{_batches_done}/{_total_batches}] bpb={_running_bpb:.6f} match_rate={_match_rate:.4f} time={_elapsed:.1f}s")
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
-    val_loss = (loss_sum / token_count).item()
-    bits_per_token = val_loss / math.log(2.0)
-    tokens_per_byte = token_count.item() / byte_count.item()
-    if _diag_total > 0:
-        _match_rate = _diag_matched / _diag_total
-        _match_acc = _diag_correct / max(_diag_matched, 1)
-        _avg_conf = _diag_conf_sum / max(_diag_matched, 1)
-        _log0(f"  seq_match_diag: match_rate={_match_rate:.4f} match_accuracy={_match_acc:.4f} "
-              f"avg_confidence={_avg_conf:.4f} matched={_diag_matched} total={_diag_total}")
-    base_model.train()
-    return val_loss, bits_per_token * tokens_per_byte
-
-
 # --- Sliding window evaluation ---
 
 def eval_val_sliding(
@@ -1817,76 +1621,6 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
-    if args.eval_token_limit > 0 and args.eval_token_limit < val_tokens.numel():
-        original_len = val_tokens.numel()
-        val_tokens = val_tokens[:args.eval_token_limit]
-        log0(f"eval_token_limit: using first {val_tokens.numel()} of {original_len} tokens")
-    # --- Eval-only mode: skip training, load checkpoint, run eval ---
-    if args.eval_only_checkpoint:
-        log0(f"eval_only_mode: loading {args.eval_only_checkpoint}")
-        with open(args.eval_only_checkpoint, "rb") as f:
-            quant_blob_disk = f.read()
-        log0(f"checkpoint_bytes: {len(quant_blob_disk)}")
-        quant_state = torch.load(
-            io.BytesIO(lzma.decompress(quant_blob_disk)),
-            map_location="cpu",
-        )
-        _tmp_model = GPT(
-            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-            mtp_num_heads=0, mtp_loss_weight=0.0,
-            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-            xsa_last_n=args.xsa_last_n,
-            rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
-            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-            gated_attention=args.gated_attention, value_residual=args.value_residual,
-        ).to("cpu")
-        sd_cpu = {k: v.detach().cpu() for k, v in _tmp_model.state_dict().items()}
-        del _tmp_model
-        unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
-        deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
-        deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
-        eval_model = GPT(
-            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-            mtp_num_heads=0, mtp_loss_weight=0.0,
-            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-            xsa_last_n=args.xsa_last_n,
-            rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
-            ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-            gated_attention=args.gated_attention, value_residual=args.value_residual,
-        ).to(device).bfloat16()
-        eval_model.qo_bank.data = eval_model.qo_bank.data.float()
-        eval_model.kv_bank.data = eval_model.kv_bank.data.float()
-        eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
-        eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
-        for m in eval_model.modules():
-            if isinstance(m, CastedLinear):
-                m.float()
-        restore_low_dim_params_to_fp32(eval_model)
-        eval_model.load_state_dict(deq_state, strict=True)
-        log0("eval_only_mode: model loaded, starting eval")
-        sw_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
-        if args.seq_match_enabled and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
-            torch.cuda.synchronize()
-            t_sm = time.perf_counter()
-            sm_loss, sm_bpb = eval_val_sliding_seq_match(
-                args, eval_model, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                stride=args.eval_stride,
-                eval_seq_len=sw_seq_len,
-            )
-            torch.cuda.synchronize()
-            log0(f"sequence_matching val_loss:{sm_loss:.4f} val_bpb:{sm_bpb:.4f} "
-                 f"eval_time:{1000.0 * (time.perf_counter() - t_sm):.0f}ms")
-            log0(f"sequence_matching_exact val_loss:{sm_loss:.8f} val_bpb:{sm_bpb:.8f}")
-        if distributed:
-            dist.destroy_process_group()
-        return
     CastedLinear._qat_enabled = args.qat_enabled
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -2316,15 +2050,6 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model int6+lzma: {quant_file_bytes} bytes")
         log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
-        if args.checkpoint_save_path:
-            import shutil
-            shutil.copy2("final_model.int6.ptz", args.checkpoint_save_path)
-            log0(f"checkpoint_saved: {args.checkpoint_save_path}")
-    if args.skip_eval:
-        log0("skip_eval: skipping all evaluation, exiting after checkpoint save")
-        if distributed:
-            dist.destroy_process_group()
-        return
     if distributed:
         dist.barrier()
     with open("final_model.int6.ptz", "rb") as f:
@@ -2404,20 +2129,6 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
-    # Sequence matching eval
-    if args.seq_match_enabled and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
-        torch.cuda.synchronize()
-        t_sm = time.perf_counter()
-        sm_loss, sm_bpb = eval_val_sliding_seq_match(
-            args, eval_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride,
-            eval_seq_len=sw_seq_len,
-        )
-        torch.cuda.synchronize()
-        log0(f"sequence_matching val_loss:{sm_loss:.4f} val_bpb:{sm_bpb:.4f} "
-             f"eval_time:{1000.0 * (time.perf_counter() - t_sm):.0f}ms")
-        log0(f"sequence_matching_exact val_loss:{sm_loss:.8f} val_bpb:{sm_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":

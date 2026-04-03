@@ -114,6 +114,8 @@ class Hyperparameters:
     eval_token_limit = int(os.environ.get("EVAL_TOKEN_LIMIT", "0"))
     # Skip eval (train + save checkpoint only)
     skip_eval = bool(int(os.environ.get("SKIP_EVAL", "0")))
+    # Skip sliding window baseline in eval-only mode
+    skip_sw_baseline = bool(int(os.environ.get("SKIP_SW_BASELINE", "0")))
     # Adaptive entropy-based cache gating
     cache_adaptive = bool(int(os.environ.get("CACHE_ADAPTIVE", "1")))
 
@@ -1826,7 +1828,7 @@ def main() -> None:
         eval_model.load_state_dict(deq_state, strict=True)
         log0("eval_only_mode: model loaded, starting eval")
         sw_seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
-        if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+        if not args.skip_sw_baseline and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
             torch.cuda.synchronize()
             t_slide = time.perf_counter()
             sw_val_loss, sw_val_bpb = eval_val_sliding(
@@ -1839,6 +1841,8 @@ def main() -> None:
             log0(f"sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
                  f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
             log0(f"sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        elif args.skip_sw_baseline:
+            log0("sliding_window: skipped (SKIP_SW_BASELINE=1)")
         if args.cache_enabled and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
             torch.cuda.synchronize()
             t_cache = time.perf_counter()

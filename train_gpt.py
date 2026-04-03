@@ -119,6 +119,8 @@ class Hyperparameters:
     # Exact sequence matching orders
     cache_min_order = int(os.environ.get("CACHE_MIN_ORDER", "6"))
     cache_max_order = int(os.environ.get("CACHE_MAX_ORDER", "12"))
+    # Skip TTT in eval-only mode
+    skip_ttt = bool(int(os.environ.get("SKIP_TTT", "0")))
     # Adaptive entropy-based cache gating
     cache_adaptive = bool(int(os.environ.get("CACHE_ADAPTIVE", "1")))
 
@@ -1846,6 +1848,21 @@ def main() -> None:
             log0(f"sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         elif args.skip_sw_baseline:
             log0("sliding_window: skipped (SKIP_SW_BASELINE=1)")
+        # TTT (mutates eval_model in place — cache sidecar after this uses TTT-adapted model)
+        if args.ttt_enabled and not args.skip_ttt and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+            torch.cuda.synchronize()
+            t_ttt = time.perf_counter()
+            ttt_loss, ttt_bpb = eval_val_sliding_ttt(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, log0=log0,
+            )
+            torch.cuda.synchronize()
+            log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
+                 f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
+            log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        elif args.skip_ttt:
+            log0("ttt: skipped (SKIP_TTT=1)")
         if args.cache_enabled and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
             torch.cuda.synchronize()
             t_cache = time.perf_counter()

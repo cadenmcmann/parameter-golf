@@ -116,6 +116,9 @@ class Hyperparameters:
     skip_eval = bool(int(os.environ.get("SKIP_EVAL", "0")))
     # Skip sliding window baseline in eval-only mode
     skip_sw_baseline = bool(int(os.environ.get("SKIP_SW_BASELINE", "0")))
+    # Exact sequence matching orders
+    cache_min_order = int(os.environ.get("CACHE_MIN_ORDER", "6"))
+    cache_max_order = int(os.environ.get("CACHE_MAX_ORDER", "12"))
     # Adaptive entropy-based cache gating
     cache_adaptive = bool(int(os.environ.get("CACHE_ADAPTIVE", "1")))
 
@@ -1198,7 +1201,7 @@ def eval_val_sliding_cache(
     base_model.eval()
 
     # Exact sequence cache — no hidden states needed
-    seq_cache = ExactSequenceCache(args.vocab_size, min_order=6, max_order=12)
+    seq_cache = ExactSequenceCache(args.vocab_size, min_order=args.cache_min_order, max_order=args.cache_max_order)
     lc = args.cache_lambda_cache  # weight for exact-match predictions
     # Keep val_tokens as a CPU list for fast Python-level lookups
     val_tok_list = val_tokens.tolist()
